@@ -137,12 +137,81 @@ def calcular_margenes(L):
 # 3. CÁLCULO DE RESPUESTAS
 # ===========================================================================
 
-def respuesta_impulso(T, t_final=5.0, n_pts=600):
-    """Respuesta al impulso de T(s)."""
+def respuesta_condicion_inicial_completa(tipo, Kp, Ki, Kd,
+                                         theta0_deg=15.0, t_final=5.0, n_pts=600):
+    """
+    Simula θ(t) desde θ₀=theta0_deg usando el modelo completo de 4 estados
+    [x, ẋ, θ, θ̇] con RK4 y el controlador tipo/Kp/Ki/Kd en lazo cerrado.
+    Idéntico al loop de simulación del carro — permite comparar directamente.
+    Devuelve (t, theta_grados).
+    """
+    dt = t_final / n_pts
+    x  = np.array([0.0, 0.0, np.radians(theta0_deg), 0.0])
+    integral   = 0.0
+    error_prev = 0.0
+
+    t_hist     = []
+    theta_hist = []
+
+    for i in range(n_pts):
+        theta = x[2]
+        error = theta   # igual que el loop del carro (u>0 estabiliza theta>0)
+        P = Kp * error
+        if tipo in ("PI", "PID"):
+            integral = float(np.clip(integral + error * dt, -50.0, 50.0))
+            I = Ki * integral
+        else:
+            I = 0.0
+        D = Kd * (error - error_prev) / dt if tipo in ("PD", "PID") and dt > 0 else 0.0
+        u = float(np.clip(P + I + D, -50.0, 50.0))
+        error_prev = error
+
+        def f(xx):
+            return (A_SS @ xx.reshape(-1, 1) + B_SS * u).flatten()
+        k1 = f(x)
+        k2 = f(x + 0.5*dt*k1)
+        k3 = f(x + 0.5*dt*k2)
+        k4 = f(x + dt*k3)
+        x  = x + (dt/6.0)*(k1 + 2*k2 + 2*k3 + k4)
+
+        t_hist.append((i + 1) * dt)
+        theta_hist.append(np.degrees(x[2]))
+
+        if abs(np.degrees(x[2])) > 89.0:
+            for j in range(i + 1, n_pts):
+                t_hist.append((j + 1) * dt)
+                theta_hist.append(np.nan)
+            break
+
+    return np.array(t_hist), np.array(theta_hist)
+
+
+def respuesta_condicion_inicial(T, t_final=5.0, n_pts=600, theta0_deg=15.0):
+    """
+    Respuesta a condición inicial θ₀=theta0_deg con el sistema en lazo cerrado T(s).
+    Usa ct.initial_response() — equivale a lo que se ve en la simulación del carro.
+    """
     try:
         t = np.linspace(0, t_final, n_pts)
-        t_out, y_out = ct.impulse_response(T, T=t)
-        y_out = np.clip(np.asarray(y_out).flatten(), -1e6, 1e6)
+        T_ss = ct.tf2ss(T)
+        n_states = T_ss.A.shape[0]
+        C = np.asarray(T_ss.C).flatten()
+        A = np.asarray(T_ss.A)
+
+        # Construye la matriz de observabilidad [C; CA; CA²; ...] y resuelve
+        # para x0 tal que y(0)=theta0_rad y todas las derivadas iniciales = 0.
+        # Necesario porque los estados canónicos de ct.tf2ss no son θ directamente.
+        rows = [C.copy()]
+        for _ in range(n_states - 1):
+            rows.append(rows[-1] @ A)
+        M = np.vstack(rows)
+        rhs = np.zeros(n_states)
+        rhs[0] = np.radians(theta0_deg)
+        x0, _, _, _ = np.linalg.lstsq(M, rhs, rcond=None)
+
+        t_out, y_out = ct.initial_response(T_ss, T=t, X0=x0)
+        y_out = np.degrees(np.asarray(y_out).flatten())
+        y_out = np.clip(y_out, -1e6, 1e6)
         return t_out, y_out
     except Exception:
         return np.linspace(0, t_final, n_pts), np.full(n_pts, np.nan)
@@ -152,7 +221,7 @@ def respuesta_impulso(T, t_final=5.0, n_pts=600):
 # 4. FIGURAS DE ANÁLISIS (Plotly)
 # ===========================================================================
 
-def fig_impulso(curvas, t_final=5.0, height=300):
+def fig_condicion_inicial(curvas, t_final=5.0, height=300):
     fig = go.Figure()
     fig.add_hline(y=0, line=dict(color=COLOR_REF, width=1.5, dash="dot"),
                   annotation_text="Ref", annotation_position="top right")
@@ -160,12 +229,12 @@ def fig_impulso(curvas, t_final=5.0, height=300):
         fig.add_trace(go.Scatter(
             x=c["t"], y=c["y"], mode="lines", name=c["nombre"],
             line=dict(color=c["color"], width=2.2, dash=c.get("dash", "solid")),
-            hovertemplate="t=%{x:.3f}s<br>y=%{y:.4f}<extra></extra>",
+            hovertemplate="t=%{x:.3f}s<br>θ=%{y:.2f}°<extra></extra>",
         ))
     fig.update_layout(
         template=PLOTLY_TEMPLATE,
-        title=dict(text="Respuesta al Impulso", font=dict(size=14)),
-        xaxis_title="Tiempo (s)", yaxis_title="y(t)",
+        title=dict(text="Respuesta a Condición Inicial — Modelo Completo (θ₀=15°)", font=dict(size=14)),
+        xaxis_title="Tiempo (s)", yaxis_title="θ (°)",
         height=height, margin=dict(l=50, r=20, t=40, b=40),
         legend=dict(orientation="h", yanchor="bottom", y=-0.45,
                     xanchor="center", x=0.5, font=dict(size=10)),
@@ -377,16 +446,24 @@ def dibujar_frame(x_carro: float, theta_rad: float,
     cart_h  = 40          # px alto carro
     wheel_r = 10          # px radio rueda
     pole_px = int(L_PEND * _SCALE * 2.2)   # longitud visual varilla en px
-    ball_r  = 14          # px radio bola
 
     # Centro vertical de la pista
     track_y = int(alto * 0.68)
 
-    # Centro horizontal del carro (limitar visualmente a ±2.2 m)
-    x_vis   = float(np.clip(x_carro, -2.2, 2.2))
-    cart_cx = int(ancho / 2 + x_vis * _SCALE)
+    # El carro siempre en el centro del canvas; el mundo se desplaza con él
+    cart_cx = ancho // 2
     cart_top    = track_y - cart_h
     cart_bottom = track_y
+
+    # Cargar fuentes aquí (necesarias para las marcas de pista)
+    try:
+        font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 15)
+        font_sm = ImageFont.truetype(
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", 13)
+    except Exception:
+        font = ImageFont.load_default()
+        font_sm = font
 
     # --- Pista ---
     draw.line([(0, track_y + wheel_r + 2), (ancho, track_y + wheel_r + 2)],
@@ -395,10 +472,21 @@ def dibujar_frame(x_carro: float, theta_rad: float,
         draw.line([(xi, track_y + wheel_r + 2), (xi - 10, track_y + wheel_r + 14)],
                   fill=_C_TRACK_L, width=2)
 
-    # Línea de referencia central (x = 0)
-    ref_cx = ancho // 2
+    # Línea de referencia x=0 — se desplaza relativamente al carro
+    ref_cx = int(ancho // 2 - x_carro * _SCALE)
     draw.line([(ref_cx, track_y - cart_h - 8), (ref_cx, track_y + wheel_r + 20)],
               fill=_C_REF, width=2)
+
+    # Marcas de posición cada 0.5 m (se desplazan con la cámara)
+    for metro in range(-10, 11):
+        marca_x = int(ancho // 2 - x_carro * _SCALE + metro * _SCALE * 0.5)
+        if 0 < marca_x < ancho:
+            draw.line([(marca_x, track_y + wheel_r + 2),
+                       (marca_x, track_y + wheel_r + 10)],
+                      fill=_C_TRACK, width=2)
+            if metro % 2 == 0:
+                draw.text((marca_x - 8, track_y + wheel_r + 12),
+                          f"{metro * 0.5:.1f}m", fill=_C_TRACK, font=font_sm)
 
     # --- Carro (rectángulo redondeado aproximado) ---
     l = cart_cx - cart_w // 2
@@ -435,14 +523,10 @@ def dibujar_frame(x_carro: float, theta_rad: float,
     draw.line([(pivot_px, pivot_py), (tip_px, tip_py)],
               fill=_C_POLE, width=9)
 
-    # --- Bola en la punta ---
-    draw.ellipse([tip_px - ball_r, tip_py - ball_r,
-                  tip_px + ball_r, tip_py + ball_r],
-                 fill=_C_BALL, outline=(80, 10, 10), width=2)
-    # Reflejo de luz en la bola
-    draw.ellipse([tip_px - ball_r + 4, tip_py - ball_r + 3,
-                  tip_px - ball_r + 10, tip_py - ball_r + 9],
-                 fill=(220, 100, 100))
+    # --- Extremo superior de la varilla (redondeado) ---
+    draw.ellipse([tip_px - 5, tip_py - 5,
+                  tip_px + 5, tip_py + 5],
+                 fill=_C_POLE, outline=_C_POLE)
 
     # --- Pivote ---
     draw.ellipse([pivot_px - 7, pivot_py - 7,
@@ -457,15 +541,6 @@ def dibujar_frame(x_carro: float, theta_rad: float,
             draw.ellipse([ax-2, ay-2, ax+2, ay+2], fill=(100, 150, 255))
 
     # --- HUD: ángulo y posición ---
-    try:
-        font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf", 15)
-        font_sm = ImageFont.truetype(
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf", 13)
-    except Exception:
-        font = ImageFont.load_default()
-        font_sm = font
-
     theta_deg = math.degrees(theta_rad)
     hud_lines = [
         f"θ = {theta_deg:+.2f}°",
@@ -596,3 +671,99 @@ def pid_step(error, dt, Kp, Ki, Kd, tipo, integral, error_prev):
 
     u = float(np.clip(P + I + D, -50.0, 50.0))
     return u, integral, error_prev
+
+
+# ===========================================================================
+# 8. AUTO-SINTONIZACIÓN (scipy differential_evolution)
+# ===========================================================================
+
+def auto_sintonizar(tipo, A, B, theta0_deg=15.0, t_final=5.0, saturacion=50.0):
+    """
+    Encuentra las ganancias óptimas (Kp, Ki, Kd) para el controlador `tipo`
+    minimizando el tiempo de asentamiento al 2% desde θ₀=theta0_deg,
+    usando el modelo lineal completo de 4 estados simulado con RK4.
+
+    Devuelve dict con keys: 'Kp', 'Ki', 'Kd', 'Ts', 'exito'
+    """
+    from scipy.optimize import differential_evolution
+
+    dt = 0.005
+    n_steps = int(t_final / dt)
+    theta0 = np.radians(theta0_deg)
+    x0 = np.array([0.0, 0.0, theta0, 0.0])
+
+    if tipo == "P":
+        bounds = [(0.1, 200.0)]
+    elif tipo == "PI":
+        bounds = [(0.1, 200.0), (0.0, 200.0)]
+    elif tipo == "PD":
+        bounds = [(0.1, 200.0), (0.0, 30.0)]
+    elif tipo == "PID":
+        bounds = [(0.1, 200.0), (0.0, 200.0), (0.0, 30.0)]
+    else:
+        return {"Kp": 0.0, "Ki": 0.0, "Kd": 0.0, "Ts": None, "exito": False}
+
+    def simular(params):
+        if tipo == "P":
+            Kp, Ki, Kd = params[0], 0.0, 0.0
+        elif tipo == "PI":
+            Kp, Ki, Kd = params[0], params[1], 0.0
+        elif tipo == "PD":
+            Kp, Ki, Kd = params[0], 0.0, params[1]
+        elif tipo == "PID":
+            Kp, Ki, Kd = params[0], params[1], params[2]
+
+        x = x0.copy()
+        integral = 0.0
+        error_prev = 0.0
+        theta_hist = []
+
+        for _ in range(n_steps):
+            theta = x[2]
+            error = theta   # u>0 estabiliza theta>0 (B[3,0]<0)
+            P = Kp * error
+            integral = np.clip(integral + error * dt, -50.0, 50.0)
+            I = Ki * integral
+            D = Kd * (error - error_prev) / dt
+            u = np.clip(P + I + D, -saturacion, saturacion)
+            error_prev = error
+
+            def f(xx):
+                return (A @ xx.reshape(-1, 1) + B * u).flatten()
+            k1 = f(x)
+            k2 = f(x + 0.5 * dt * k1)
+            k3 = f(x + 0.5 * dt * k2)
+            k4 = f(x + dt * k3)
+            x = x + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
+
+            theta_hist.append(x[2])
+
+            if abs(np.degrees(x[2])) > 89.0:
+                return 1e6
+
+        theta_arr = np.array(theta_hist)
+        banda = 0.02 * abs(theta0)
+        fuera = np.where(np.abs(theta_arr) > banda)[0]
+        Ts = fuera[-1] * dt if len(fuera) > 0 else 0.0
+        return Ts
+
+    resultado = differential_evolution(
+        simular, bounds=bounds,
+        maxiter=80, popsize=10, tol=1e-3,
+        seed=42, workers=1, polish=True
+    )
+
+    if tipo == "P":
+        Kp, Ki, Kd = resultado.x[0], 0.0, 0.0
+    elif tipo == "PI":
+        Kp, Ki, Kd = resultado.x[0], resultado.x[1], 0.0
+    elif tipo == "PD":
+        Kp, Ki, Kd = resultado.x[0], 0.0, resultado.x[1]
+    elif tipo == "PID":
+        Kp, Ki, Kd = resultado.x[0], resultado.x[1], resultado.x[2]
+
+    Ts_final = resultado.fun
+    exito = Ts_final < 1e5
+
+    return {"Kp": round(Kp, 3), "Ki": round(Ki, 3), "Kd": round(Kd, 3),
+            "Ts": round(Ts_final, 4) if exito else None, "exito": exito}
