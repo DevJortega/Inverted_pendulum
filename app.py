@@ -15,6 +15,8 @@ import streamlit as st
 import streamlit.components.v1 as components
 import control as ct
 
+from control_fisico import ClienteESP32, FrameTel
+
 from graficos import (
     # Planta y matrices de estado
     PLANT, A_SS, B_SS, C_SS, D_SS,
@@ -62,6 +64,10 @@ st.markdown("""
     }
     div[data-testid="stMetricValue"] { font-size: 1.1rem; }
     div[data-testid="stMetricLabel"] { font-size: 0.85rem; }
+    .btn-inactive {
+        opacity: 0.4 !important;
+        pointer-events: none !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -104,6 +110,26 @@ for k, v in _sim_keys.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
+if "esp32" not in st.session_state:
+    st.session_state.esp32 = ClienteESP32()
+if "fisico_running" not in st.session_state:
+    st.session_state.fisico_running = False
+if "fisico_t_hist" not in st.session_state:
+    st.session_state.fisico_t_hist = []
+if "fisico_theta_hist" not in st.session_state:
+    st.session_state.fisico_theta_hist = []
+if "fisico_t0" not in st.session_state:
+    st.session_state.fisico_t0 = None
+
+if "ctrl_tipo_global" not in st.session_state:
+    st.session_state.ctrl_tipo_global = "PID"
+if "ctrl_Kp_global" not in st.session_state:
+    st.session_state.ctrl_Kp_global = 50.0
+if "ctrl_Ki_global" not in st.session_state:
+    st.session_state.ctrl_Ki_global = 10.0
+if "ctrl_Kd_global" not in st.session_state:
+    st.session_state.ctrl_Kd_global = 5.0
+
 
 # ===========================================================================
 # Helpers
@@ -139,6 +165,47 @@ def rk4_step(x, u, dt):
     return x + (dt / 6.0) * (k1 + 2*k2 + 2*k3 + k4)
 
 
+# Callbacks de sincronización: on_change actualiza el global ANTES del rerun,
+# para que el "set-before" de los demás sliders lea el valor correcto.
+def _sync_tipo_analisis():
+    v = st.session_state.radio_ctrl
+    if v != "Lazo Abierto":
+        st.session_state.ctrl_tipo_global = v
+
+def _sync_tipo_sim():
+    st.session_state.ctrl_tipo_global = st.session_state.ctrl_tipo_sim
+
+def _sync_tipo_fisico():
+    st.session_state.ctrl_tipo_global = st.session_state.ctrl_tipo_fisico
+
+def _sync_Kp_analisis():
+    st.session_state.ctrl_Kp_global = st.session_state.ctrl_Kp_analisis
+
+def _sync_Kp_sim():
+    st.session_state.ctrl_Kp_global = st.session_state.ctrl_Kp_sim
+
+def _sync_Kp_fisico():
+    st.session_state.ctrl_Kp_global = st.session_state.ctrl_Kp_fisico
+
+def _sync_Ki_analisis():
+    st.session_state.ctrl_Ki_global = st.session_state.ctrl_Ki_analisis
+
+def _sync_Ki_sim():
+    st.session_state.ctrl_Ki_global = st.session_state.ctrl_Ki_sim
+
+def _sync_Ki_fisico():
+    st.session_state.ctrl_Ki_global = st.session_state.ctrl_Ki_fisico
+
+def _sync_Kd_analisis():
+    st.session_state.ctrl_Kd_global = st.session_state.ctrl_Kd_analisis
+
+def _sync_Kd_sim():
+    st.session_state.ctrl_Kd_global = st.session_state.ctrl_Kd_sim
+
+def _sync_Kd_fisico():
+    st.session_state.ctrl_Kd_global = st.session_state.ctrl_Kd_fisico
+
+
 # ===========================================================================
 # ENCABEZADO
 # ===========================================================================
@@ -150,7 +217,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab_analisis, tab_simulacion = st.tabs(["📊 Análisis y Diseño", "🎮 Simulación del Carro"])
+tab_analisis, tab_simulacion, tab_fisico = st.tabs(["📊 Análisis y Diseño", "🎮 Simulación del Carro", "🔌 Control Físico"])
 
 # ===========================================================================
 # PESTAÑA 1: ANÁLISIS
@@ -160,30 +227,38 @@ with tab_analisis:
 
     with col_izq:
         st.markdown("#### ⚙️ Configuración")
+        _opts_a = ["Lazo Abierto", "P", "PI", "PD", "PID"]
+        if st.session_state.ctrl_tipo_global in _opts_a:
+            st.session_state.radio_ctrl = st.session_state.ctrl_tipo_global
         tipo = st.radio(
             "Controlador actual",
-            ["Lazo Abierto", "P", "PI", "PD", "PID"],
-            index=["Lazo Abierto","P","PI","PD","PID"].index(
-                st.session_state.controlador_actual),
+            _opts_a,
             horizontal=True, key="radio_ctrl",
+            on_change=_sync_tipo_analisis,
         )
         st.session_state.controlador_actual = tipo
 
         if tipo != "Lazo Abierto":
-            st.session_state[f"{tipo}_Kp"] = st.slider(
-                "Kp", 0.0, 200.0, float(st.session_state[f"{tipo}_Kp"]), 0.5,
-                key=f"slider_Kp_{tipo}")
+            st.session_state.ctrl_Kp_analisis = min(200.0, float(st.session_state.ctrl_Kp_global))
+            st.session_state.ctrl_Kp_global = st.slider(
+                "Kp", 0.0, 200.0, step=0.5,
+                key="ctrl_Kp_analisis", on_change=_sync_Kp_analisis)
+            st.session_state[f"{tipo}_Kp"] = st.session_state.ctrl_Kp_global
         else:
             st.info("Lazo abierto: la salida diverge.")
 
         if tipo in ("PI", "PID"):
-            st.session_state[f"{tipo}_Ki"] = st.slider(
-                "Ki", 0.0, 200.0, float(st.session_state[f"{tipo}_Ki"]), 0.5,
-                key=f"slider_Ki_{tipo}")
+            st.session_state.ctrl_Ki_analisis = min(200.0, float(st.session_state.ctrl_Ki_global))
+            st.session_state.ctrl_Ki_global = st.slider(
+                "Ki", 0.0, 200.0, step=0.5,
+                key="ctrl_Ki_analisis", on_change=_sync_Ki_analisis)
+            st.session_state[f"{tipo}_Ki"] = st.session_state.ctrl_Ki_global
         if tipo in ("PD", "PID"):
-            st.session_state[f"{tipo}_Kd"] = st.slider(
-                "Kd", 0.0, 30.0, float(st.session_state[f"{tipo}_Kd"]), 0.05,
-                key=f"slider_Kd_{tipo}")
+            st.session_state.ctrl_Kd_analisis = min(30.0, float(st.session_state.ctrl_Kd_global))
+            st.session_state.ctrl_Kd_global = st.slider(
+                "Kd", 0.0, 30.0, step=0.05,
+                key="ctrl_Kd_analisis", on_change=_sync_Kd_analisis)
+            st.session_state[f"{tipo}_Kd"] = st.session_state.ctrl_Kd_global
 
         t_final = st.slider("Tiempo simulación (s)", 1.0, 20.0, 5.0, 0.5)
 
@@ -204,12 +279,19 @@ with tab_analisis:
         if st.button("↺ Restablecer ganancias"):
             for k, v in DEFAULTS[tipo].items():
                 st.session_state[f"{tipo}_{k}"] = v
+            if tipo != "Lazo Abierto":
+                st.session_state.ctrl_Kp_global = DEFAULTS[tipo]["Kp"]
+                st.session_state.ctrl_Ki_global = DEFAULTS[tipo]["Ki"]
+                st.session_state.ctrl_Kd_global = DEFAULTS[tipo]["Kd"]
             st.rerun()
 
     with col_der:
-        Kp = st.session_state[f"{tipo}_Kp"]
-        Ki = st.session_state[f"{tipo}_Ki"]
-        Kd = st.session_state[f"{tipo}_Kd"]
+        if tipo == "Lazo Abierto":
+            Kp, Ki, Kd = 1.0, 0.0, 0.0
+        else:
+            Kp = st.session_state.ctrl_Kp_global
+            Ki = st.session_state.ctrl_Ki_global
+            Kd = st.session_state.ctrl_Kd_global
         T_sys, C_sys = sistema_lazo_cerrado(tipo, Kp, Ki, Kd)
         t_arr, y_arr = respuesta_condicion_inicial_completa(tipo, Kp, Ki, Kd, t_final=t_final)
         metricas     = calcular_metricas_impulso(T_sys, t_arr, y_arr)
@@ -317,26 +399,31 @@ with tab_simulacion:
     # ----- Panel derecho: controles -----
     with col_sim_der:
         st.markdown("#### 🎛️ Controlador")
+        _opts_sim = ["P","PI","PD","PID"]
+        _tipo_g = st.session_state.ctrl_tipo_global
+        st.session_state.ctrl_tipo_sim = _tipo_g if _tipo_g in _opts_sim else "PID"
         sim_tipo = st.radio(
-            "Tipo", ["P","PI","PD","PID"],
-            index=["P","PI","PD","PID"].index(
-                st.session_state.sim_ctrl_tipo
-                if st.session_state.sim_ctrl_tipo in ("P","PI","PD","PID") else "PID"),
-            horizontal=True, key="radio_sim_ctrl",
+            "Tipo", _opts_sim,
+            horizontal=True, key="ctrl_tipo_sim",
+            on_change=_sync_tipo_sim,
         )
+        st.session_state.ctrl_tipo_global = sim_tipo
         st.session_state.sim_ctrl_tipo = sim_tipo
 
-        st.session_state[f"{sim_tipo}_Kp"] = st.slider(
-            "Kp", 0.0, 200.0, float(st.session_state[f"{sim_tipo}_Kp"]), 0.5,
-            key=f"sim_Kp_{sim_tipo}")
+        st.session_state.ctrl_Kp_sim = min(200.0, float(st.session_state.ctrl_Kp_global))
+        st.session_state.ctrl_Kp_global = st.slider(
+            "Kp", 0.0, 200.0, step=0.5,
+            key="ctrl_Kp_sim", on_change=_sync_Kp_sim)
         if sim_tipo in ("PI","PID"):
-            st.session_state[f"{sim_tipo}_Ki"] = st.slider(
-                "Ki", 0.0, 200.0, float(st.session_state[f"{sim_tipo}_Ki"]), 0.5,
-                key=f"sim_Ki_{sim_tipo}")
+            st.session_state.ctrl_Ki_sim = min(200.0, float(st.session_state.ctrl_Ki_global))
+            st.session_state.ctrl_Ki_global = st.slider(
+                "Ki", 0.0, 200.0, step=0.5,
+                key="ctrl_Ki_sim", on_change=_sync_Ki_sim)
         if sim_tipo in ("PD","PID"):
-            st.session_state[f"{sim_tipo}_Kd"] = st.slider(
-                "Kd", 0.0, 30.0, float(st.session_state[f"{sim_tipo}_Kd"]), 0.05,
-                key=f"sim_Kd_{sim_tipo}")
+            st.session_state.ctrl_Kd_sim = min(30.0, float(st.session_state.ctrl_Kd_global))
+            st.session_state.ctrl_Kd_global = st.slider(
+                "Kd", 0.0, 30.0, step=0.05,
+                key="ctrl_Kd_sim", on_change=_sync_Kd_sim)
 
         st.markdown("---")
         st.markdown("#### 🎯 Auto-sintonización")
@@ -347,6 +434,9 @@ with tab_simulacion:
                 from graficos import auto_sintonizar
                 res = auto_sintonizar(sim_tipo, A_SS, B_SS)
             if res["exito"]:
+                st.session_state.ctrl_Kp_global = res["Kp"]
+                st.session_state.ctrl_Ki_global = res["Ki"]
+                st.session_state.ctrl_Kd_global = res["Kd"]
                 st.session_state[f"{sim_tipo}_Kp"] = res["Kp"]
                 st.session_state[f"{sim_tipo}_Ki"] = res["Ki"]
                 st.session_state[f"{sim_tipo}_Kd"] = res["Kd"]
@@ -358,16 +448,20 @@ with tab_simulacion:
         st.markdown("---")
         st.markdown("#### ▶️ Controles")
         cb1, cb2 = st.columns(2)
-        if not st.session_state.sim_running:
-            if cb1.button("▶ Iniciar", use_container_width=True, key="btn_start"):
-                st.session_state.sim_running = True
-                st.rerun()
-        else:
-            if cb1.button("■ Detener", use_container_width=True, key="btn_stop"):
-                st.session_state.sim_running = False
-                st.rerun()
+        if cb1.button("▶ Iniciar", use_container_width=True, key="btn_start",
+                      disabled=st.session_state.sim_running):
+            st.session_state.sim_running = True
+            st.rerun()
+        if cb2.button("■ Detener", use_container_width=True, key="btn_stop",
+                      disabled=not st.session_state.sim_running):
+            st.session_state.sim_running = False
+            st.rerun()
 
-        if cb2.button("↺ Reset", use_container_width=True, key="btn_reset"):
+        if st.button("↺ Reset", use_container_width=True, key="btn_reset"):
+            reset_simulacion()
+            st.rerun()
+
+        if st.button("⏹ Detener y limpiar", use_container_width=True, key="btn_detener_limpiar"):
             reset_simulacion()
             st.rerun()
 
@@ -438,9 +532,9 @@ with tab_simulacion:
             dt_int          = DT / N_SUB
             FRAMES_X_BLOQUE = 12      # frames por bloque antes de rerun
 
-            Kp_s = st.session_state[f"{sim_tipo}_Kp"]
-            Ki_s = st.session_state[f"{sim_tipo}_Ki"]
-            Kd_s = st.session_state[f"{sim_tipo}_Kd"]
+            Kp_s = st.session_state.ctrl_Kp_global
+            Ki_s = st.session_state.ctrl_Ki_global
+            Kd_s = st.session_state.ctrl_Kd_global
 
             x_state    = st.session_state.sim_state.copy().astype(float)
             integral   = float(st.session_state.sim_integral)
@@ -460,7 +554,7 @@ with tab_simulacion:
                 # Acción de control PID
                 u, integral, _ = pid_step(
                     error, dt_int, Kp_s, Ki_s, Kd_s,
-                    sim_tipo, integral, error_prev)
+                    st.session_state.ctrl_tipo_global, integral, error_prev)
                 error_prev = error
 
                 # Integración RK4 (N_SUB subpasos)
@@ -515,3 +609,201 @@ with tab_simulacion:
 
             if st.session_state.sim_running:
                 st.rerun()
+
+# ===========================================================================
+# PESTAÑA 3: CONTROL FÍSICO (ESP32 via UDP)
+# ===========================================================================
+with tab_fisico:
+    esp32: ClienteESP32 = st.session_state.esp32
+
+    col_f_izq, col_f_der = st.columns([3, 1], gap="medium")
+
+    # ----- Panel derecho: conexión y controlador -----
+    with col_f_der:
+
+        # --- Conexión ---
+        st.markdown("#### 📡 Conexión ESP32")
+        st.caption("Conéctate a la red WiFi **PenduloPID** (pass: `pendulo123`) antes de continuar.")
+
+        conectado = esp32.conectado
+        if conectado:
+            st.success(f"✅ Conectado — {esp32.frames_recibidos} frames rx")
+        else:
+            st.error("❌ Sin señal del ESP32")
+
+        c1, c2 = st.columns(2)
+        if c1.button("🔗 Conectar", use_container_width=True, key="btn_f_conectar"):
+            if esp32._sock is None or not esp32._activo:
+                ok = esp32.conectar()
+                if ok:
+                    st.success("Socket abierto")
+                else:
+                    st.error("Error abriendo socket")
+            st.rerun()
+
+        if c2.button("⛔ Desconectar", use_container_width=True, key="btn_f_desconectar"):
+            esp32.desconectar()
+            st.session_state.fisico_running = False
+            st.rerun()
+
+        st.markdown("---")
+
+        # --- Controlador ---
+        st.markdown("#### 🎛️ Controlador")
+        _opts_f = ["P", "PI", "PD", "PID"]
+        _tipo_gf = st.session_state.ctrl_tipo_global
+        st.session_state.ctrl_tipo_fisico = _tipo_gf if _tipo_gf in _opts_f else "PID"
+        f_tipo = st.radio(
+            "Tipo", _opts_f,
+            horizontal=True, key="ctrl_tipo_fisico",
+            on_change=_sync_tipo_fisico,
+        )
+        st.session_state.ctrl_tipo_global = f_tipo
+
+        st.session_state.ctrl_Kp_fisico = float(st.session_state.ctrl_Kp_global)
+        f_Kp = st.slider("Kp", 0.0, 400.0, step=1.0,
+                          key="ctrl_Kp_fisico", on_change=_sync_Kp_fisico)
+        st.session_state.ctrl_Kp_global = f_Kp
+        f_Ki = 0.0
+        f_Kd = 0.0
+        if f_tipo in ("PI", "PID"):
+            st.session_state.ctrl_Ki_fisico = min(300.0, float(st.session_state.ctrl_Ki_global))
+            f_Ki = st.slider("Ki", 0.0, 300.0, step=1.0,
+                              key="ctrl_Ki_fisico", on_change=_sync_Ki_fisico)
+            st.session_state.ctrl_Ki_global = f_Ki
+        if f_tipo in ("PD", "PID"):
+            st.session_state.ctrl_Kd_fisico = min(50.0, float(st.session_state.ctrl_Kd_global))
+            f_Kd = st.slider("Kd", 0.0, 50.0, step=0.5,
+                              key="ctrl_Kd_fisico", on_change=_sync_Kd_fisico)
+            st.session_state.ctrl_Kd_global = f_Kd
+
+        if st.button("📤 Enviar parámetros", use_container_width=True, key="btn_f_params"):
+            esp32.cmd_set_params(
+                st.session_state.ctrl_tipo_global,
+                st.session_state.ctrl_Kp_global,
+                st.session_state.ctrl_Ki_global,
+                st.session_state.ctrl_Kd_global,
+            )
+            st.success(
+                f"Enviado: {st.session_state.ctrl_tipo_global} "
+                f"Kp={st.session_state.ctrl_Kp_global} "
+                f"Ki={st.session_state.ctrl_Ki_global} "
+                f"Kd={st.session_state.ctrl_Kd_global}"
+            )
+
+        st.markdown("---")
+
+        # --- Controles ---
+        st.markdown("#### ▶️ Controles")
+
+        if st.button("🔄 Reset encoder", use_container_width=True, key="btn_f_reset_enc"):
+            esp32.cmd_reset_encoder()
+            st.session_state.fisico_t_hist     = []
+            st.session_state.fisico_theta_hist = []
+            st.session_state.fisico_t0         = None
+            st.info("Encoder reseteado")
+
+        cc1, cc2 = st.columns(2)
+        if cc1.button("▶ Iniciar", use_container_width=True, key="btn_f_start",
+                      disabled=st.session_state.fisico_running):
+            esp32.cmd_set_params(
+                st.session_state.ctrl_tipo_global,
+                st.session_state.ctrl_Kp_global,
+                st.session_state.ctrl_Ki_global,
+                st.session_state.ctrl_Kd_global,
+            )
+            time.sleep(0.05)
+            esp32.cmd_start()
+            st.session_state.fisico_running = True
+            st.session_state.fisico_t0      = time.time()
+            st.rerun()
+
+        if cc2.button("■ Detener", use_container_width=True, key="btn_f_stop",
+                      disabled=not st.session_state.fisico_running):
+            esp32.cmd_stop()
+            st.session_state.fisico_running = False
+            st.rerun()
+
+        st.markdown("---")
+
+        # --- Estado en tiempo real ---
+        st.markdown("##### 📊 Estado")
+        frame = esp32.ultimo_frame()
+        if frame:
+            st.metric("θ actual",  f"{frame.angulo:.2f}°")
+            st.metric("Error",     f"{frame.error:.2f}°")
+            st.metric("PWM",       f"{frame.pwm}")
+            st.metric("Estado",    frame.estado)
+            col_p, col_i, col_d = st.columns(3)
+            col_p.metric("P", f"{frame.P:.1f}")
+            col_i.metric("I", f"{frame.I:.1f}")
+            col_d.metric("D", f"{frame.D:.1f}")
+        else:
+            st.metric("θ actual", "—")
+            st.metric("Error",    "—")
+            st.metric("PWM",      "—")
+
+    # ----- Panel izquierdo: gráfica en tiempo real -----
+    with col_f_izq:
+        st.markdown("##### 📈 Ángulo θ en tiempo real (datos físicos)")
+
+        # Leer frames nuevos de la cola
+        frames_nuevos = esp32.vaciar_cola()
+        if frames_nuevos and st.session_state.fisico_t0 is not None:
+            t0 = st.session_state.fisico_t0
+            for fr in frames_nuevos:
+                st.session_state.fisico_t_hist.append(fr.ts - t0)
+                st.session_state.fisico_theta_hist.append(fr.angulo)
+
+            # Limitar historial a 60 s
+            if len(st.session_state.fisico_t_hist) > 1200:
+                st.session_state.fisico_t_hist     = st.session_state.fisico_t_hist[-1000:]
+                st.session_state.fisico_theta_hist = st.session_state.fisico_theta_hist[-1000:]
+
+        # Gráfica
+        import plotly.graph_objects as go
+        fig_f = go.Figure()
+        fig_f.add_hline(y=180, line=dict(color="#dc2626", width=1.5, dash="dot"))
+        fig_f.add_hline(y=195, line=dict(color="#f59e0b", width=1,   dash="dash"))
+        fig_f.add_hline(y=165, line=dict(color="#f59e0b", width=1,   dash="dash"))
+
+        if len(st.session_state.fisico_t_hist) > 0:
+            fig_f.add_trace(go.Scatter(
+                x=st.session_state.fisico_t_hist,
+                y=st.session_state.fisico_theta_hist,
+                mode="lines",
+                line=dict(color="#2563eb", width=2),
+                name="θ físico",
+                hovertemplate="t=%{x:.2f}s<br>θ=%{y:.2f}°<extra></extra>",
+            ))
+            t_max = st.session_state.fisico_t_hist[-1]
+            ventana = 20.0
+            fig_f.update_xaxes(range=[max(0, t_max - ventana), t_max + 0.5])
+
+        fig_f.update_layout(
+            template="plotly_white",
+            xaxis_title="Tiempo (s)",
+            yaxis_title="θ (°)",
+            yaxis=dict(range=[120, 240]),
+            height=420,
+            margin=dict(l=50, r=20, t=20, b=40),
+            showlegend=False,
+        )
+        st.plotly_chart(fig_f, use_container_width=True,
+                        config={"displayModeBar": False})
+
+        # Tabla de últimos valores
+        if len(st.session_state.fisico_t_hist) > 0:
+            with st.expander("📋 Últimos 10 frames", expanded=False):
+                import pandas as pd
+                n = min(10, len(st.session_state.fisico_t_hist))
+                df = pd.DataFrame({
+                    "t (s)": [f"{v:.3f}" for v in st.session_state.fisico_t_hist[-n:]],
+                    "θ (°)": [f"{v:.2f}" for v in st.session_state.fisico_theta_hist[-n:]],
+                })
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
+        # Auto-refresh mientras está corriendo
+        if st.session_state.fisico_running and conectado:
+            time.sleep(0.1)
+            st.rerun()
