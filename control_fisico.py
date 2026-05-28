@@ -6,6 +6,7 @@ El ESP32 crea la red WiFi "PenduloPID" (192.168.4.1).
 El PC se conecta a esa red y usa este módulo para:
   - Recibir telemetría: angulo, error, P, I, D, pwm, estado
   - Enviar comandos:    START, STOP, SET Kp Ki Kd tipo
+                        COMP b0 b1 b2 a1 a2  (compensador discreto)
 """
 
 import socket
@@ -192,6 +193,18 @@ class ClienteESP32:
         Ejemplo: SET,PID,120.0,50.0,8.0
         """
         msg = f"SET,{tipo},{Kp:.3f},{Ki:.3f},{Kd:.3f}"
+        self._enviar(msg)
+
+    def cmd_set_compensador(self, b0: float, b1: float, b2: float,
+                            a1: float, a2: float):
+        """
+        Envía los coeficientes de un compensador discreto (Tustin) al ESP32.
+        Ecuación en diferencias implementada en el firmware:
+          u[k] = b0*e[k] + b1*e[k-1] + b2*e[k-2] - a1*u[k-1] - a2*u[k-2]
+        Para compensadores de primer orden (Adelanto/Atraso), b2 = a2 = 0.
+        Formato: COMP,b0,b1,b2,a1,a2
+        """
+        msg = f"COMP,{b0:.6f},{b1:.6f},{b2:.6f},{a1:.6f},{a2:.6f}"
         self._enviar(msg)
 
     def cmd_reset_encoder(self):

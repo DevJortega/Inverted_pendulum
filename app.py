@@ -25,6 +25,7 @@ from graficos import (
     COLOR_MAIN, COLOR_REF, COLORS_OVERLAY,
     # Sistema
     construir_controlador, sistema_lazo_cerrado,
+    TIPOS_COMPENSADOR,
     # Métricas
     calcular_metricas_impulso, calcular_margenes,
     # Respuestas
@@ -37,6 +38,11 @@ from graficos import (
     figura_theta_tiempo,
     # PID
     pid_step,
+    # Diseño de compensadores
+    disenar_compensador_adelanto,
+    disenar_compensador_atraso,
+    disenar_compensador_adelanto_atraso,
+    discretizar_compensador,
 )
 
 # ===========================================================================
@@ -75,11 +81,15 @@ st.markdown("""
 # Valores por defecto de ganancias
 # ===========================================================================
 DEFAULTS = {
-    "Lazo Abierto": {"Kp": 1.0,  "Ki": 0.0, "Kd": 0.0},
-    "P":            {"Kp": 30.0, "Ki": 0.0, "Kd": 0.0},
-    "PI":           {"Kp": 30.0, "Ki": 5.0, "Kd": 0.0},
-    "PD":           {"Kp": 40.0, "Ki": 0.0, "Kd": 3.0},
-    "PID":          {"Kp": 50.0, "Ki": 10.0,"Kd": 5.0},
+    "Lazo Abierto": {"Kp": 1.0,  "Ki": 0.0,  "Kd": 0.0},
+    "P":            {"Kp": 30.0, "Ki": 0.0,  "Kd": 0.0},
+    "PI":           {"Kp": 30.0, "Ki": 5.0,  "Kd": 0.0},
+    "PD":           {"Kp": 40.0, "Ki": 0.0,  "Kd": 3.0},
+    "PID":          {"Kp": 50.0, "Ki": 10.0, "Kd": 5.0},
+    # Compensadores: Kp=T, Ki=alpha/beta/T2, Kd=Kc/beta
+    "Adelanto":     {"Kp": 0.1,  "Ki": 0.1,  "Kd": 50.0},
+    "Atraso":       {"Kp": 2.0,  "Ki": 5.0,  "Kd": 50.0},
+    "Atr-Adel":     {"Kp": 0.1,  "Ki": 2.0,  "Kd": 5.0},
 }
 
 # ===========================================================================
@@ -105,6 +115,8 @@ _sim_keys = {
     "sim_error_prev": 0.0,
     "sim_perturbar":  False,
     "sim_ctrl_tipo":  "PID",
+    "sim_comp_state": None,          # estado del compensador (numpy array o None)
+    "comp_diseno_texto": None,       # texto resultado diseño automático
 }
 for k, v in _sim_keys.items():
     if k not in st.session_state:
@@ -145,6 +157,7 @@ def reset_simulacion():
     st.session_state.sim_integral   = 0.0
     st.session_state.sim_error_prev = 0.0
     st.session_state.sim_perturbar  = False
+    st.session_state.sim_comp_state = None
 
 
 def aplicar_perturbacion(x_state):
@@ -227,7 +240,7 @@ with tab_analisis:
 
     with col_izq:
         st.markdown("#### ⚙️ Configuración")
-        _opts_a = ["Lazo Abierto", "P", "PI", "PD", "PID"]
+        _opts_a = ["Lazo Abierto", "P", "PI", "PD", "PID", "Adelanto", "Atraso", "Atr-Adel"]
         if st.session_state.ctrl_tipo_global in _opts_a:
             st.session_state.radio_ctrl = st.session_state.ctrl_tipo_global
         tipo = st.radio(
@@ -238,34 +251,98 @@ with tab_analisis:
         )
         st.session_state.controlador_actual = tipo
 
-        if tipo != "Lazo Abierto":
+        if tipo == "Lazo Abierto":
+            st.info("Lazo abierto: la salida diverge.")
+        elif tipo in TIPOS_COMPENSADOR:
+            # ---- Sliders para compensadores ----
+            lbl1 = "T₁" if tipo == "Atr-Adel" else "T"
+            st.session_state.ctrl_Kp_analisis = min(10.0, max(0.001, float(st.session_state.ctrl_Kp_global)))
+            st.session_state.ctrl_Kp_global = st.slider(
+                lbl1, 0.001, 10.0, step=0.001,
+                key="ctrl_Kp_analisis", on_change=_sync_Kp_analisis)
+            st.session_state[f"{tipo}_Kp"] = st.session_state.ctrl_Kp_global
+
+            if tipo == "Adelanto":
+                lbl2, mn2, mx2, stp2 = "α", 0.01, 0.99, 0.01
+            elif tipo == "Atraso":
+                lbl2, mn2, mx2, stp2 = "β", 1.01, 20.0, 0.01
+            else:
+                lbl2, mn2, mx2, stp2 = "T₂", 0.01, 100.0, 0.01
+            st.session_state.ctrl_Ki_analisis = min(mx2, max(mn2, float(st.session_state.ctrl_Ki_global)))
+            st.session_state.ctrl_Ki_global = st.slider(
+                lbl2, mn2, mx2, step=stp2,
+                key="ctrl_Ki_analisis", on_change=_sync_Ki_analisis)
+            st.session_state[f"{tipo}_Ki"] = st.session_state.ctrl_Ki_global
+
+            if tipo == "Atr-Adel":
+                lbl3, mn3, mx3, stp3 = "β", 1.01, 20.0, 0.01
+            else:
+                lbl3, mn3, mx3, stp3 = "Kc", 0.1, 100.0, 0.1
+            st.session_state.ctrl_Kd_analisis = min(mx3, max(mn3, float(st.session_state.ctrl_Kd_global)))
+            st.session_state.ctrl_Kd_global = st.slider(
+                lbl3, mn3, mx3, step=stp3,
+                key="ctrl_Kd_analisis", on_change=_sync_Kd_analisis)
+            st.session_state[f"{tipo}_Kd"] = st.session_state.ctrl_Kd_global
+
+            # ---- Diseño automático ----
+            st.markdown("---")
+            st.markdown("##### 🔧 Diseño automático")
+            pm_des_a = st.number_input("PM deseado (°)", 30.0, 80.0, 45.0, step=1.0,
+                                       key="pm_deseado_analisis")
+            if st.button("🔧 Diseñar", use_container_width=True, key="btn_diseno_analisis"):
+                try:
+                    if tipo == "Adelanto":
+                        p, txt = disenar_compensador_adelanto(PLANT, pm_des_a, Kc=1.0)
+                        st.session_state.ctrl_Kp_global = p["T"]
+                        st.session_state.ctrl_Ki_global = p["alpha"]
+                        st.session_state.ctrl_Kd_global = p["Kc"]
+                    elif tipo == "Atraso":
+                        p, txt = disenar_compensador_atraso(PLANT, pm_des_a, Kc=1.0)
+                        st.session_state.ctrl_Kp_global = p["T"]
+                        st.session_state.ctrl_Ki_global = p["beta"]
+                        st.session_state.ctrl_Kd_global = p["Kc"]
+                    else:
+                        p, txt = disenar_compensador_adelanto_atraso(PLANT, pm_des_a)
+                        st.session_state.ctrl_Kp_global = p["T1"]
+                        st.session_state.ctrl_Ki_global = p["T2"]
+                        st.session_state.ctrl_Kd_global = p["beta"]
+                    st.session_state[f"{tipo}_Kp"] = st.session_state.ctrl_Kp_global
+                    st.session_state[f"{tipo}_Ki"] = st.session_state.ctrl_Ki_global
+                    st.session_state[f"{tipo}_Kd"] = st.session_state.ctrl_Kd_global
+                    st.session_state.comp_diseno_texto = txt
+                except Exception as e:
+                    st.session_state.comp_diseno_texto = f"Error en diseño: {e}"
+                st.rerun()
+            if st.session_state.get("comp_diseno_texto"):
+                with st.expander("📋 Pasos del diseño", expanded=True):
+                    st.code(st.session_state.comp_diseno_texto, language="text")
+        else:
+            # ---- Sliders PID estándar ----
             st.session_state.ctrl_Kp_analisis = min(200.0, float(st.session_state.ctrl_Kp_global))
             st.session_state.ctrl_Kp_global = st.slider(
                 "Kp", 0.0, 200.0, step=0.5,
                 key="ctrl_Kp_analisis", on_change=_sync_Kp_analisis)
             st.session_state[f"{tipo}_Kp"] = st.session_state.ctrl_Kp_global
-        else:
-            st.info("Lazo abierto: la salida diverge.")
 
-        if tipo in ("PI", "PID"):
-            st.session_state.ctrl_Ki_analisis = min(200.0, float(st.session_state.ctrl_Ki_global))
-            st.session_state.ctrl_Ki_global = st.slider(
-                "Ki", 0.0, 200.0, step=0.5,
-                key="ctrl_Ki_analisis", on_change=_sync_Ki_analisis)
-            st.session_state[f"{tipo}_Ki"] = st.session_state.ctrl_Ki_global
-        if tipo in ("PD", "PID"):
-            st.session_state.ctrl_Kd_analisis = min(30.0, float(st.session_state.ctrl_Kd_global))
-            st.session_state.ctrl_Kd_global = st.slider(
-                "Kd", 0.0, 30.0, step=0.05,
-                key="ctrl_Kd_analisis", on_change=_sync_Kd_analisis)
-            st.session_state[f"{tipo}_Kd"] = st.session_state.ctrl_Kd_global
+            if tipo in ("PI", "PID"):
+                st.session_state.ctrl_Ki_analisis = min(200.0, float(st.session_state.ctrl_Ki_global))
+                st.session_state.ctrl_Ki_global = st.slider(
+                    "Ki", 0.0, 200.0, step=0.5,
+                    key="ctrl_Ki_analisis", on_change=_sync_Ki_analisis)
+                st.session_state[f"{tipo}_Ki"] = st.session_state.ctrl_Ki_global
+            if tipo in ("PD", "PID"):
+                st.session_state.ctrl_Kd_analisis = min(30.0, float(st.session_state.ctrl_Kd_global))
+                st.session_state.ctrl_Kd_global = st.slider(
+                    "Kd", 0.0, 30.0, step=0.05,
+                    key="ctrl_Kd_analisis", on_change=_sync_Kd_analisis)
+                st.session_state[f"{tipo}_Kd"] = st.session_state.ctrl_Kd_global
 
         t_final = st.slider("Tiempo simulación (s)", 1.0, 20.0, 5.0, 0.5)
 
         st.markdown("---")
         st.markdown("##### 🗂️ Comparar con:")
         overlays_seleccionados = []
-        for c in ["Lazo Abierto","P","PI","PD","PID"]:
+        for c in ["Lazo Abierto", "P", "PI", "PD", "PID"]:
             if c == tipo:
                 continue
             kp = st.session_state[f"{c}_Kp"]
@@ -380,6 +457,18 @@ with tab_analisis:
             with c1:
                 st.markdown("**Controlador C(s):**")
                 st.code(str(C_sys), language="text")
+                if tipo in TIPOS_COMPENSADOR:
+                    try:
+                        ceros_c = ct.zeros(C_sys)
+                        polos_c = ct.poles(C_sys)
+                        st.markdown("**Ceros de C(s):**")
+                        for z in ceros_c:
+                            st.code(f"  z = {z.real:.4f} {z.imag:+.4f}j", language="text")
+                        st.markdown("**Polos de C(s):**")
+                        for p in polos_c:
+                            st.code(f"  p = {p.real:.4f} {p.imag:+.4f}j", language="text")
+                    except Exception:
+                        pass
             with c2:
                 st.markdown("**Polos de lazo cerrado:**")
                 try:
@@ -399,7 +488,7 @@ with tab_simulacion:
     # ----- Panel derecho: controles -----
     with col_sim_der:
         st.markdown("#### 🎛️ Controlador")
-        _opts_sim = ["P","PI","PD","PID"]
+        _opts_sim = ["P", "PI", "PD", "PID", "Adelanto", "Atraso", "Atr-Adel"]
         _tipo_g = st.session_state.ctrl_tipo_global
         st.session_state.ctrl_tipo_sim = _tipo_g if _tipo_g in _opts_sim else "PID"
         sim_tipo = st.radio(
@@ -410,20 +499,77 @@ with tab_simulacion:
         st.session_state.ctrl_tipo_global = sim_tipo
         st.session_state.sim_ctrl_tipo = sim_tipo
 
-        st.session_state.ctrl_Kp_sim = min(200.0, float(st.session_state.ctrl_Kp_global))
-        st.session_state.ctrl_Kp_global = st.slider(
-            "Kp", 0.0, 200.0, step=0.5,
-            key="ctrl_Kp_sim", on_change=_sync_Kp_sim)
-        if sim_tipo in ("PI","PID"):
-            st.session_state.ctrl_Ki_sim = min(200.0, float(st.session_state.ctrl_Ki_global))
+        if sim_tipo in TIPOS_COMPENSADOR:
+            lbl1s = "T₁" if sim_tipo == "Atr-Adel" else "T"
+            st.session_state.ctrl_Kp_sim = min(10.0, max(0.001, float(st.session_state.ctrl_Kp_global)))
+            st.session_state.ctrl_Kp_global = st.slider(
+                lbl1s, 0.001, 10.0, step=0.001,
+                key="ctrl_Kp_sim", on_change=_sync_Kp_sim)
+
+            if sim_tipo == "Adelanto":
+                lbl2s, mn2s, mx2s, stp2s = "α", 0.01, 0.99, 0.01
+            elif sim_tipo == "Atraso":
+                lbl2s, mn2s, mx2s, stp2s = "β", 1.01, 20.0, 0.01
+            else:
+                lbl2s, mn2s, mx2s, stp2s = "T₂", 0.01, 100.0, 0.01
+            st.session_state.ctrl_Ki_sim = min(mx2s, max(mn2s, float(st.session_state.ctrl_Ki_global)))
             st.session_state.ctrl_Ki_global = st.slider(
-                "Ki", 0.0, 200.0, step=0.5,
+                lbl2s, mn2s, mx2s, step=stp2s,
                 key="ctrl_Ki_sim", on_change=_sync_Ki_sim)
-        if sim_tipo in ("PD","PID"):
-            st.session_state.ctrl_Kd_sim = min(30.0, float(st.session_state.ctrl_Kd_global))
+
+            if sim_tipo == "Atr-Adel":
+                lbl3s, mn3s, mx3s, stp3s = "β", 1.01, 20.0, 0.01
+            else:
+                lbl3s, mn3s, mx3s, stp3s = "Kc", 0.1, 100.0, 0.1
+            st.session_state.ctrl_Kd_sim = min(mx3s, max(mn3s, float(st.session_state.ctrl_Kd_global)))
             st.session_state.ctrl_Kd_global = st.slider(
-                "Kd", 0.0, 30.0, step=0.05,
+                lbl3s, mn3s, mx3s, step=stp3s,
                 key="ctrl_Kd_sim", on_change=_sync_Kd_sim)
+
+            st.markdown("---")
+            st.markdown("##### 🔧 Diseño automático")
+            pm_des_s = st.number_input("PM deseado (°)", 30.0, 80.0, 45.0, step=1.0,
+                                       key="pm_deseado_sim")
+            if st.button("🔧 Diseñar", use_container_width=True, key="btn_diseno_sim"):
+                try:
+                    if sim_tipo == "Adelanto":
+                        p, txt = disenar_compensador_adelanto(PLANT, pm_des_s, Kc=1.0)
+                        st.session_state.ctrl_Kp_global = p["T"]
+                        st.session_state.ctrl_Ki_global = p["alpha"]
+                        st.session_state.ctrl_Kd_global = p["Kc"]
+                    elif sim_tipo == "Atraso":
+                        p, txt = disenar_compensador_atraso(PLANT, pm_des_s, Kc=1.0)
+                        st.session_state.ctrl_Kp_global = p["T"]
+                        st.session_state.ctrl_Ki_global = p["beta"]
+                        st.session_state.ctrl_Kd_global = p["Kc"]
+                    else:
+                        p, txt = disenar_compensador_adelanto_atraso(PLANT, pm_des_s)
+                        st.session_state.ctrl_Kp_global = p["T1"]
+                        st.session_state.ctrl_Ki_global = p["T2"]
+                        st.session_state.ctrl_Kd_global = p["beta"]
+                    st.session_state.comp_diseno_texto = txt
+                    st.session_state.sim_comp_state = None  # reiniciar estado
+                except Exception as e:
+                    st.session_state.comp_diseno_texto = f"Error: {e}"
+                st.rerun()
+            if st.session_state.get("comp_diseno_texto"):
+                with st.expander("📋 Pasos del diseño", expanded=False):
+                    st.code(st.session_state.comp_diseno_texto, language="text")
+        else:
+            st.session_state.ctrl_Kp_sim = min(200.0, float(st.session_state.ctrl_Kp_global))
+            st.session_state.ctrl_Kp_global = st.slider(
+                "Kp", 0.0, 200.0, step=0.5,
+                key="ctrl_Kp_sim", on_change=_sync_Kp_sim)
+            if sim_tipo in ("PI", "PID"):
+                st.session_state.ctrl_Ki_sim = min(200.0, float(st.session_state.ctrl_Ki_global))
+                st.session_state.ctrl_Ki_global = st.slider(
+                    "Ki", 0.0, 200.0, step=0.5,
+                    key="ctrl_Ki_sim", on_change=_sync_Ki_sim)
+            if sim_tipo in ("PD", "PID"):
+                st.session_state.ctrl_Kd_sim = min(30.0, float(st.session_state.ctrl_Kd_global))
+                st.session_state.ctrl_Kd_global = st.slider(
+                    "Kd", 0.0, 30.0, step=0.05,
+                    key="ctrl_Kd_sim", on_change=_sync_Kd_sim)
 
         st.markdown("---")
         st.markdown("#### 🎯 Auto-sintonización")
@@ -535,10 +681,30 @@ with tab_simulacion:
             Kp_s = st.session_state.ctrl_Kp_global
             Ki_s = st.session_state.ctrl_Ki_global
             Kd_s = st.session_state.ctrl_Kd_global
+            tipo_loop = st.session_state.ctrl_tipo_global
 
             x_state    = st.session_state.sim_state.copy().astype(float)
             integral   = float(st.session_state.sim_integral)
             error_prev = float(st.session_state.sim_error_prev)
+
+            # Preparar compensador SS si corresponde
+            _usando_comp = tipo_loop in TIPOS_COMPENSADOR
+            if _usando_comp:
+                try:
+                    _C_tf = construir_controlador(tipo_loop, Kp_s, Ki_s, Kd_s)
+                    _C_ss = ct.tf2ss(_C_tf)
+                    _Ac = np.asarray(_C_ss.A)
+                    _Bc = np.asarray(_C_ss.B)
+                    _Cc = np.asarray(_C_ss.C)
+                    _Dc = np.asarray(_C_ss.D)
+                    _nc = _Ac.shape[0]
+                    x_comp = st.session_state.sim_comp_state
+                    if x_comp is None or not hasattr(x_comp, "__len__") or len(x_comp) != _nc:
+                        x_comp = np.zeros(_nc)
+                    x_comp = x_comp.astype(float)
+                except Exception:
+                    _usando_comp = False
+                    x_comp = np.zeros(1)
 
             for frame_i in range(FRAMES_X_BLOQUE):
                 # Perturbación pendiente
@@ -547,15 +713,20 @@ with tab_simulacion:
                     st.session_state.sim_perturbar = False
 
                 # Extraer θ y x del estado completo
-                x_carro = x_state[0]   # posición carro [m]
                 theta   = x_state[2]   # ángulo péndulo [rad]
                 error   = theta         # u>0 corrige theta>0 (B[3,0]<0)
 
-                # Acción de control PID
-                u, integral, _ = pid_step(
-                    error, dt_int, Kp_s, Ki_s, Kd_s,
-                    st.session_state.ctrl_tipo_global, integral, error_prev)
-                error_prev = error
+                if _usando_comp:
+                    # Acción de control via compensador SS (Euler)
+                    u_raw = float(np.dot(_Cc.flatten(), x_comp) + float(_Dc.flatten()[0]) * error)
+                    x_comp = x_comp + dt_int * (_Ac @ x_comp + (_Bc * error).flatten())
+                    u = float(np.clip(u_raw, -50.0, 50.0))
+                else:
+                    # Acción de control PID
+                    u, integral, _ = pid_step(
+                        error, dt_int, Kp_s, Ki_s, Kd_s,
+                        tipo_loop, integral, error_prev)
+                    error_prev = error
 
                 # Integración RK4 (N_SUB subpasos)
                 for _ in range(N_SUB):
@@ -606,6 +777,8 @@ with tab_simulacion:
             st.session_state.sim_state      = x_state
             st.session_state.sim_integral   = integral
             st.session_state.sim_error_prev = error_prev
+            if _usando_comp:
+                st.session_state.sim_comp_state = x_comp
 
             if st.session_state.sim_running:
                 st.rerun()
@@ -650,7 +823,7 @@ with tab_fisico:
 
         # --- Controlador ---
         st.markdown("#### 🎛️ Controlador")
-        _opts_f = ["P", "PI", "PD", "PID"]
+        _opts_f = ["P", "PI", "PD", "PID", "Adelanto", "Atraso", "Atr-Adel"]
         _tipo_gf = st.session_state.ctrl_tipo_global
         st.session_state.ctrl_tipo_fisico = _tipo_gf if _tipo_gf in _opts_f else "PID"
         f_tipo = st.radio(
@@ -660,36 +833,130 @@ with tab_fisico:
         )
         st.session_state.ctrl_tipo_global = f_tipo
 
-        st.session_state.ctrl_Kp_fisico = float(st.session_state.ctrl_Kp_global)
-        f_Kp = st.slider("Kp", 0.0, 400.0, step=1.0,
-                          key="ctrl_Kp_fisico", on_change=_sync_Kp_fisico)
-        st.session_state.ctrl_Kp_global = f_Kp
         f_Ki = 0.0
         f_Kd = 0.0
-        if f_tipo in ("PI", "PID"):
-            st.session_state.ctrl_Ki_fisico = min(300.0, float(st.session_state.ctrl_Ki_global))
-            f_Ki = st.slider("Ki", 0.0, 300.0, step=1.0,
-                              key="ctrl_Ki_fisico", on_change=_sync_Ki_fisico)
+
+        if f_tipo in TIPOS_COMPENSADOR:
+            # ---- Sliders compensador (mismos rangos que análisis/sim) ----
+            lbl1f = "T₁" if f_tipo == "Atr-Adel" else "T"
+            st.session_state.ctrl_Kp_fisico = min(10.0, max(0.001, float(st.session_state.ctrl_Kp_global)))
+            f_Kp = st.slider(lbl1f, 0.001, 10.0, step=0.001,
+                             key="ctrl_Kp_fisico", on_change=_sync_Kp_fisico)
+            st.session_state.ctrl_Kp_global = f_Kp
+
+            if f_tipo == "Adelanto":
+                lbl2f, mn2f, mx2f, stp2f = "α", 0.01, 0.99, 0.01
+            elif f_tipo == "Atraso":
+                lbl2f, mn2f, mx2f, stp2f = "β", 1.01, 20.0, 0.01
+            else:
+                lbl2f, mn2f, mx2f, stp2f = "T₂", 0.01, 100.0, 0.01
+            st.session_state.ctrl_Ki_fisico = min(mx2f, max(mn2f, float(st.session_state.ctrl_Ki_global)))
+            f_Ki = st.slider(lbl2f, mn2f, mx2f, step=stp2f,
+                             key="ctrl_Ki_fisico", on_change=_sync_Ki_fisico)
             st.session_state.ctrl_Ki_global = f_Ki
-        if f_tipo in ("PD", "PID"):
-            st.session_state.ctrl_Kd_fisico = min(50.0, float(st.session_state.ctrl_Kd_global))
-            f_Kd = st.slider("Kd", 0.0, 50.0, step=0.5,
-                              key="ctrl_Kd_fisico", on_change=_sync_Kd_fisico)
+
+            if f_tipo == "Atr-Adel":
+                lbl3f, mn3f, mx3f, stp3f = "β", 1.01, 20.0, 0.01
+            else:
+                lbl3f, mn3f, mx3f, stp3f = "Kc", 0.1, 100.0, 0.1
+            st.session_state.ctrl_Kd_fisico = min(mx3f, max(mn3f, float(st.session_state.ctrl_Kd_global)))
+            f_Kd = st.slider(lbl3f, mn3f, mx3f, step=stp3f,
+                             key="ctrl_Kd_fisico", on_change=_sync_Kd_fisico)
             st.session_state.ctrl_Kd_global = f_Kd
 
+            # ---- Diseño automático ----
+            pm_des_f = st.number_input("PM deseado (°)", 30.0, 80.0, 45.0, step=1.0,
+                                       key="pm_deseado_fisico")
+            if st.button("🔧 Diseñar", use_container_width=True, key="btn_diseno_fisico"):
+                try:
+                    if f_tipo == "Adelanto":
+                        pcomp, txt = disenar_compensador_adelanto(PLANT, pm_des_f, Kc=1.0)
+                        st.session_state.ctrl_Kp_global = pcomp["T"]
+                        st.session_state.ctrl_Ki_global = pcomp["alpha"]
+                        st.session_state.ctrl_Kd_global = pcomp["Kc"]
+                    elif f_tipo == "Atraso":
+                        pcomp, txt = disenar_compensador_atraso(PLANT, pm_des_f, Kc=1.0)
+                        st.session_state.ctrl_Kp_global = pcomp["T"]
+                        st.session_state.ctrl_Ki_global = pcomp["beta"]
+                        st.session_state.ctrl_Kd_global = pcomp["Kc"]
+                    else:
+                        pcomp, txt = disenar_compensador_adelanto_atraso(PLANT, pm_des_f)
+                        st.session_state.ctrl_Kp_global = pcomp["T1"]
+                        st.session_state.ctrl_Ki_global = pcomp["T2"]
+                        st.session_state.ctrl_Kd_global = pcomp["beta"]
+                    st.session_state[f"{f_tipo}_Kp"] = st.session_state.ctrl_Kp_global
+                    st.session_state[f"{f_tipo}_Ki"] = st.session_state.ctrl_Ki_global
+                    st.session_state[f"{f_tipo}_Kd"] = st.session_state.ctrl_Kd_global
+                    st.session_state.comp_diseno_texto = txt
+                except Exception as e:
+                    st.session_state.comp_diseno_texto = f"Error en diseño: {e}"
+                st.rerun()
+            if st.session_state.get("comp_diseno_texto"):
+                with st.expander("📋 Pasos del diseño", expanded=False):
+                    st.code(st.session_state.comp_diseno_texto, language="text")
+
+            # ---- Vista previa de coeficientes discretos ----
+            try:
+                _b0, _b1, _b2, _a1, _a2 = discretizar_compensador(
+                    f_tipo,
+                    st.session_state.ctrl_Kp_global,
+                    st.session_state.ctrl_Ki_global,
+                    st.session_state.ctrl_Kd_global,
+                    Ts=0.005,
+                )
+                st.caption("Coeficientes discretos (Tustin, Ts=5ms) a enviar:")
+                st.code(
+                    f"b0={_b0:.5f}  b1={_b1:.5f}  b2={_b2:.5f}\n"
+                    f"a1={_a1:.5f}  a2={_a2:.5f}",
+                    language="text",
+                )
+            except Exception as e:
+                st.warning(f"No se pudo discretizar: {e}")
+        else:
+            # ---- Sliders PID estándar ----
+            st.session_state.ctrl_Kp_fisico = float(st.session_state.ctrl_Kp_global)
+            f_Kp = st.slider("Kp", 0.0, 400.0, step=1.0,
+                              key="ctrl_Kp_fisico", on_change=_sync_Kp_fisico)
+            st.session_state.ctrl_Kp_global = f_Kp
+            if f_tipo in ("PI", "PID"):
+                st.session_state.ctrl_Ki_fisico = min(300.0, float(st.session_state.ctrl_Ki_global))
+                f_Ki = st.slider("Ki", 0.0, 300.0, step=1.0,
+                                  key="ctrl_Ki_fisico", on_change=_sync_Ki_fisico)
+                st.session_state.ctrl_Ki_global = f_Ki
+            if f_tipo in ("PD", "PID"):
+                st.session_state.ctrl_Kd_fisico = min(50.0, float(st.session_state.ctrl_Kd_global))
+                f_Kd = st.slider("Kd", 0.0, 50.0, step=0.5,
+                                  key="ctrl_Kd_fisico", on_change=_sync_Kd_fisico)
+                st.session_state.ctrl_Kd_global = f_Kd
+
         if st.button("📤 Enviar parámetros", use_container_width=True, key="btn_f_params"):
-            esp32.cmd_set_params(
-                st.session_state.ctrl_tipo_global,
-                st.session_state.ctrl_Kp_global,
-                st.session_state.ctrl_Ki_global,
-                st.session_state.ctrl_Kd_global,
-            )
-            st.success(
-                f"Enviado: {st.session_state.ctrl_tipo_global} "
-                f"Kp={st.session_state.ctrl_Kp_global} "
-                f"Ki={st.session_state.ctrl_Ki_global} "
-                f"Kd={st.session_state.ctrl_Kd_global}"
-            )
+            _tg = st.session_state.ctrl_tipo_global
+            if _tg in TIPOS_COMPENSADOR:
+                b0, b1, b2, a1, a2 = discretizar_compensador(
+                    _tg,
+                    st.session_state.ctrl_Kp_global,
+                    st.session_state.ctrl_Ki_global,
+                    st.session_state.ctrl_Kd_global,
+                    Ts=0.005,
+                )
+                esp32.cmd_set_compensador(b0, b1, b2, a1, a2)
+                st.success(
+                    f"Enviado COMP ({_tg}): "
+                    f"b0={b0:.4f} b1={b1:.4f} b2={b2:.4f} a1={a1:.4f} a2={a2:.4f}"
+                )
+            else:
+                esp32.cmd_set_params(
+                    _tg,
+                    st.session_state.ctrl_Kp_global,
+                    st.session_state.ctrl_Ki_global,
+                    st.session_state.ctrl_Kd_global,
+                )
+                st.success(
+                    f"Enviado: {_tg} "
+                    f"Kp={st.session_state.ctrl_Kp_global} "
+                    f"Ki={st.session_state.ctrl_Ki_global} "
+                    f"Kd={st.session_state.ctrl_Kd_global}"
+                )
 
         st.markdown("---")
 
@@ -706,12 +973,23 @@ with tab_fisico:
         cc1, cc2 = st.columns(2)
         if cc1.button("▶ Iniciar", use_container_width=True, key="btn_f_start",
                       disabled=st.session_state.fisico_running):
-            esp32.cmd_set_params(
-                st.session_state.ctrl_tipo_global,
-                st.session_state.ctrl_Kp_global,
-                st.session_state.ctrl_Ki_global,
-                st.session_state.ctrl_Kd_global,
-            )
+            _tg = st.session_state.ctrl_tipo_global
+            if _tg in TIPOS_COMPENSADOR:
+                b0, b1, b2, a1, a2 = discretizar_compensador(
+                    _tg,
+                    st.session_state.ctrl_Kp_global,
+                    st.session_state.ctrl_Ki_global,
+                    st.session_state.ctrl_Kd_global,
+                    Ts=0.005,
+                )
+                esp32.cmd_set_compensador(b0, b1, b2, a1, a2)
+            else:
+                esp32.cmd_set_params(
+                    _tg,
+                    st.session_state.ctrl_Kp_global,
+                    st.session_state.ctrl_Ki_global,
+                    st.session_state.ctrl_Kd_global,
+                )
             time.sleep(0.05)
             esp32.cmd_start()
             st.session_state.fisico_running = True

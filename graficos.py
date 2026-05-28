@@ -85,7 +85,56 @@ def construir_controlador(tipo, Kp, Ki, Kd):
         num = [Kp + Kd * N, Kp * N + Ki, Ki * N]
         den = [1, N, 0]
         return ct.tf(num, den)
+    if tipo == "Adelanto":
+        T, alpha = Kp, Ki
+        Kc = Kd
+        return ct.tf([Kc*T, Kc], [alpha*T, 1])
+    if tipo == "Atraso":
+        T, beta = Kp, Ki
+        Kc = Kd
+        return ct.tf([Kc*beta*T, Kc*beta], [beta*T, 1])
+    if tipo == "Atr-Adel":
+        T1, T2, beta = Kp, Ki, Kd
+        Kc = 1.0
+        num = np.polymul([T1, 1], [T2, 1])
+        den = np.polymul([T1/beta, 1], [beta*T2, 1])
+        return ct.tf(Kc * num, den)
     return ct.tf([1], [1])
+
+
+TIPOS_COMPENSADOR = {"Adelanto", "Atraso", "Atr-Adel"}
+
+
+def discretizar_compensador(tipo, Kp, Ki, Kd, Ts=0.005):
+    """
+    Discretiza el compensador C(s) por Tustin (bilineal) a periodo Ts.
+    Devuelve (b0, b1, b2, a1, a2) normalizados (a0 = 1) para la
+    ecuación en diferencias:
+        u[k] = b0*e[k] + b1*e[k-1] + b2*e[k-2] - a1*u[k-1] - a2*u[k-2]
+
+    Compensadores de primer orden (Adelanto/Atraso) devuelven b2 = a2 = 0.
+    El ESP32 ejecuta directamente estos coeficientes; toda la discretización
+    se hace aquí en el PC.
+    """
+    C = construir_controlador(tipo, Kp, Ki, Kd)
+    Cd = ct.sample_system(C, Ts, method="tustin")
+
+    num = np.atleast_1d(np.asarray(Cd.num).squeeze()).astype(float)
+    den = np.atleast_1d(np.asarray(Cd.den).squeeze()).astype(float)
+
+    # Normalizar a a0 = 1 y rellenar a longitud 3 (orden 2 máximo).
+    # El padding va a la DERECHA: los términos de menor orden (z^-1, z^-2)
+    # quedan en cero para compensadores de primer orden.
+    a0 = den[0]
+    num = num / a0
+    den = den / a0
+    num = np.concatenate([num, np.zeros(3 - len(num))])[:3]
+    den = np.concatenate([den, np.zeros(3 - len(den))])[:3]
+
+    b0, b1, b2 = num[0], num[1], num[2]
+    a1, a2     = den[1], den[2]
+    return float(b0), float(b1), float(b2), float(a1), float(a2)
+
 
 
 def sistema_lazo_cerrado(tipo, Kp, Ki, Kd):
@@ -147,11 +196,51 @@ def respuesta_condicion_inicial_completa(tipo, Kp, Ki, Kd,
     """
     dt = t_final / n_pts
     x  = np.array([0.0, 0.0, np.radians(theta0_deg), 0.0])
-    integral   = 0.0
-    error_prev = 0.0
 
     t_hist     = []
     theta_hist = []
+
+    if tipo in TIPOS_COMPENSADOR:
+        try:
+            C = construir_controlador(tipo, Kp, Ki, Kd)
+            C_ss_obj = ct.tf2ss(C)
+            Ac = np.asarray(C_ss_obj.A)
+            Bc = np.asarray(C_ss_obj.B)
+            Cc = np.asarray(C_ss_obj.C)
+            Dc = np.asarray(C_ss_obj.D)
+            n_c = Ac.shape[0]
+            x_comp = np.zeros(n_c)
+        except Exception:
+            return np.linspace(0, t_final, n_pts), np.full(n_pts, np.nan)
+
+        for i in range(n_pts):
+            theta = x[2]
+            error = theta
+            u_raw = float(np.dot(Cc.flatten(), x_comp) + float(Dc.flatten()[0]) * error)
+            x_comp = x_comp + dt * (Ac @ x_comp + (Bc * error).flatten())
+            u = float(np.clip(u_raw, -50.0, 50.0))
+
+            def f(xx):
+                return (A_SS @ xx.reshape(-1, 1) + B_SS * u).flatten()
+            k1 = f(x)
+            k2 = f(x + 0.5*dt*k1)
+            k3 = f(x + 0.5*dt*k2)
+            k4 = f(x + dt*k3)
+            x  = x + (dt/6.0)*(k1 + 2*k2 + 2*k3 + k4)
+
+            t_hist.append((i + 1) * dt)
+            theta_hist.append(np.degrees(x[2]))
+
+            if abs(np.degrees(x[2])) > 89.0:
+                for j in range(i + 1, n_pts):
+                    t_hist.append((j + 1) * dt)
+                    theta_hist.append(np.nan)
+                break
+
+        return np.array(t_hist), np.array(theta_hist)
+
+    integral   = 0.0
+    error_prev = 0.0
 
     for i in range(n_pts):
         theta = x[2]
@@ -767,3 +856,193 @@ def auto_sintonizar(tipo, A, B, theta0_deg=15.0, t_final=5.0, saturacion=50.0):
 
     return {"Kp": round(Kp, 3), "Ki": round(Ki, 3), "Kd": round(Kd, 3),
             "Ts": round(Ts_final, 4) if exito else None, "exito": exito}
+
+
+# ===========================================================================
+# 9. DISEÑO AUTOMÁTICO DE COMPENSADORES
+# ===========================================================================
+
+def disenar_compensador_adelanto(plant_tf, pm_deseado, Kc=1.0):
+    """
+    Diseño de compensador de adelanto por método de Bode (8 pasos).
+    Gc(s) = Kc*(Ts+1)/(alpha*Ts+1), 0 < alpha < 1.
+    Devuelve (params_dict, texto_pasos).
+    """
+    pasos = []
+
+    # Paso 1
+    L0 = Kc * plant_tf
+    pasos.append(f"Paso 1: L₀(s) = {Kc}·G(s)  [sistema no compensado]")
+
+    # Paso 2
+    _, pm0, _, wcp0 = calcular_margenes(L0)
+    if pm0 is None:
+        pm0 = 0.0
+    if wcp0 is None or not np.isfinite(wcp0):
+        wcp0 = 1.0
+    pasos.append(f"Paso 2: PM₀ = {pm0:.2f}°,  ωcp = {wcp0:.4f} rad/s")
+
+    # Paso 3
+    delta = 8.0
+    phi_m = float(np.clip(pm_deseado - pm0 + delta, 5.0, 75.0))
+    pasos.append(f"Paso 3: φₘ = PM_des − PM₀ + δ = {pm_deseado}° − {pm0:.2f}° + {delta}° = {phi_m:.2f}°")
+
+    # Paso 4
+    phi_m_rad = np.radians(phi_m)
+    alpha = float(np.clip((1.0 - np.sin(phi_m_rad)) / (1.0 + np.sin(phi_m_rad)), 0.01, 0.99))
+    pasos.append(f"Paso 4: α = (1−sin φₘ)/(1+sin φₘ) = {alpha:.4f}")
+
+    # Paso 5
+    omega = np.logspace(-3, 4, 10000)
+    try:
+        mag, _, w = ct.frequency_response(L0, omega)
+        mag = np.asarray(mag).flatten()
+        target = np.sqrt(alpha)
+        idx = np.argmin(np.abs(mag - target))
+        omega_m = float(w[idx])
+    except Exception:
+        omega_m = wcp0 * 1.5
+    pasos.append(f"Paso 5: Buscar ωₘ tal que |L₀(jωₘ)| = √α = {np.sqrt(alpha):.4f}  →  ωₘ = {omega_m:.4f} rad/s")
+
+    # Paso 6
+    T = 1.0 / (omega_m * np.sqrt(alpha))
+    pasos.append(f"Paso 6: T = 1/(ωₘ·√α) = 1/({omega_m:.4f}·{np.sqrt(alpha):.4f}) = {T:.4f} s")
+
+    # Paso 7
+    pasos.append(f"Paso 7: Gc(s) = {Kc}·({T:.4f}s + 1) / ({alpha*T:.4f}s + 1)")
+
+    # Paso 8
+    try:
+        Gc = construir_controlador("Adelanto", T, alpha, Kc)
+        _, pm_new, _, _ = calcular_margenes(Gc * plant_tf)
+        pm_str = f"{pm_new:.2f}°" if pm_new is not None else "N/D"
+    except Exception:
+        pm_str = "N/D"
+    pasos.append(f"Paso 8: Verificación  →  PM obtenido = {pm_str}  (objetivo: {pm_deseado}°)")
+
+    params = {"T": round(T, 4), "alpha": round(alpha, 4), "Kc": round(Kc, 4)}
+    return params, "\n".join(pasos)
+
+
+def disenar_compensador_atraso(plant_tf, pm_deseado, Kc=1.0):
+    """
+    Diseño de compensador de atraso por método de Bode (7 pasos).
+    Gc(s) = Kc*beta*(Ts+1)/(beta*Ts+1), beta > 1.
+    Devuelve (params_dict, texto_pasos).
+    """
+    pasos = []
+
+    # Paso 1
+    L0 = Kc * plant_tf
+    pasos.append(f"Paso 1: L₀(s) = {Kc}·G(s)  [sistema no compensado]")
+
+    # Paso 2
+    _, pm0, _, wcp0 = calcular_margenes(L0)
+    if pm0 is None:
+        pm0 = 0.0
+    if wcp0 is None or not np.isfinite(wcp0):
+        wcp0 = 1.0
+    pasos.append(f"Paso 2: PM₀ = {pm0:.2f}°,  ωcp₀ = {wcp0:.4f} rad/s")
+
+    # Paso 3
+    target_phase = -180.0 + pm_deseado + 5.0
+    pasos.append(f"Paso 3: Buscar ωc_new donde ∠L₀(jω) = −180° + {pm_deseado}° + 5° = {target_phase:.1f}°")
+
+    # Paso 4
+    omega = np.logspace(-4, 4, 20000)
+    try:
+        mag, phase, w = ct.frequency_response(L0, omega)
+        mag = np.asarray(mag).flatten()
+        phase_deg = np.degrees(np.asarray(phase).flatten())
+        idx = np.argmin(np.abs(phase_deg - target_phase))
+        omega_c_new = float(w[idx])
+        gain_at_wc = float(mag[idx])
+    except Exception:
+        omega_c_new = wcp0 * 0.1
+        gain_at_wc = 5.0
+    pasos.append(f"Paso 4: ωc_new = {omega_c_new:.4f} rad/s,  |L₀(jωc)| = {gain_at_wc:.4f}")
+
+    # Paso 5
+    beta = float(max(gain_at_wc, 1.1))
+    pasos.append(f"Paso 5: β = |L₀(jωc)| = {beta:.4f}  (β > 1 para atenuación en alta freq)")
+
+    # Paso 6
+    T = 10.0 / omega_c_new
+    pasos.append(f"Paso 6: T = 10/ωc = 10/{omega_c_new:.4f} = {T:.4f} s  (cero en ωc/10)")
+
+    # Paso 7
+    try:
+        Gc = construir_controlador("Atraso", T, beta, Kc)
+        _, pm_new, _, _ = calcular_margenes(Gc * plant_tf)
+        pm_str = f"{pm_new:.2f}°" if pm_new is not None else "N/D"
+    except Exception:
+        pm_str = "N/D"
+    pasos.append(f"Paso 7: Gc(s) = {Kc}·{beta:.4f}·({T:.4f}s+1)/({beta*T:.4f}s+1)")
+    pasos.append(f"        Verificación  →  PM obtenido = {pm_str}  (objetivo: {pm_deseado}°)")
+
+    params = {"T": round(T, 4), "beta": round(beta, 4), "Kc": round(Kc, 4)}
+    return params, "\n".join(pasos)
+
+
+def disenar_compensador_adelanto_atraso(plant_tf, pm_deseado):
+    """
+    Diseño de compensador adelanto-atraso combinado.
+    Gc(s) = (T1s+1)(T2s+1) / ((T1/beta·s+1)(beta·T2·s+1)).
+    Devuelve (params_dict, texto_pasos).
+    """
+    pasos = []
+    pasos.append(f"=== Compensador Adelanto-Atraso  (PM deseado: {pm_deseado}°) ===")
+    pasos.append("")
+
+    # --- Parte adelanto: determinar T1 y beta ---
+    pasos.append("--- PARTE 1: Compensador de Adelanto (fase) ---")
+    _, pm0, _, wcp0 = calcular_margenes(plant_tf)
+    if pm0 is None:
+        pm0 = 0.0
+    if wcp0 is None or not np.isfinite(wcp0):
+        wcp0 = 1.0
+
+    delta = 8.0
+    phi_m = float(np.clip(pm_deseado - pm0 + delta, 5.0, 75.0))
+    phi_m_rad = np.radians(phi_m)
+    alpha = float(np.clip((1.0 - np.sin(phi_m_rad)) / (1.0 + np.sin(phi_m_rad)), 0.01, 0.99))
+    beta = round(1.0 / alpha, 4)
+
+    omega = np.logspace(-3, 4, 10000)
+    try:
+        mag, _, w = ct.frequency_response(plant_tf, omega)
+        mag = np.asarray(mag).flatten()
+        target = np.sqrt(alpha)
+        idx = np.argmin(np.abs(mag - target))
+        omega_m = float(w[idx])
+    except Exception:
+        omega_m = wcp0 * 1.5
+
+    T1 = 1.0 / (omega_m * np.sqrt(alpha))
+
+    pasos.append(f"Paso 1: PM₀ = {pm0:.2f}°,  φₘ = {phi_m:.2f}°")
+    pasos.append(f"Paso 2: α = {alpha:.4f}  →  β = 1/α = {beta:.4f}")
+    pasos.append(f"Paso 3: ωₘ = {omega_m:.4f} rad/s  →  T₁ = 1/(ωₘ·√α) = {T1:.4f} s")
+
+    # --- Parte atraso: determinar T2 ---
+    pasos.append("")
+    pasos.append("--- PARTE 2: Compensador de Atraso (estado estacionario) ---")
+    T2 = 10.0 * T1
+    pasos.append(f"Paso 4: T₂ = 10·T₁ = {T2:.4f} s  (cero en {1/T2:.4f} rad/s, lejos de ωₘ)")
+    pasos.append(f"Paso 5: β = {beta:.4f}  (mismo que compensador de adelanto)")
+
+    # --- Verificación ---
+    pasos.append("")
+    pasos.append("--- COMPENSADOR COMBINADO ---")
+    try:
+        Gc = construir_controlador("Atr-Adel", T1, T2, beta)
+        _, pm_new, _, _ = calcular_margenes(Gc * plant_tf)
+        pm_str = f"{pm_new:.2f}°" if pm_new is not None else "N/D"
+    except Exception:
+        pm_str = "N/D"
+    pasos.append(f"Gc(s) = (T₁s+1)(T₂s+1) / ((T₁/βs+1)(βT₂s+1))")
+    pasos.append(f"      = ({T1:.4f}s+1)({T2:.4f}s+1) / ({T1/beta:.6f}s+1)({beta*T2:.4f}s+1)")
+    pasos.append(f"Verificación  →  PM obtenido = {pm_str}  (objetivo: {pm_deseado}°)")
+
+    params = {"T1": round(T1, 4), "T2": round(T2, 4), "beta": round(beta, 4)}
+    return params, "\n".join(pasos)
