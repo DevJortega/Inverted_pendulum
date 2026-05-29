@@ -318,22 +318,22 @@ with tab_analisis:
                     st.code(st.session_state.comp_diseno_texto, language="text")
         else:
             # ---- Sliders PID estándar ----
-            st.session_state.ctrl_Kp_analisis = min(200.0, float(st.session_state.ctrl_Kp_global))
+            st.session_state.ctrl_Kp_analisis = float(st.session_state.ctrl_Kp_global)
             st.session_state.ctrl_Kp_global = st.slider(
-                "Kp", 0.0, 200.0, step=0.5,
+                "Kp", 0.0, 400.0, step=0.5,
                 key="ctrl_Kp_analisis", on_change=_sync_Kp_analisis)
             st.session_state[f"{tipo}_Kp"] = st.session_state.ctrl_Kp_global
 
             if tipo in ("PI", "PID"):
-                st.session_state.ctrl_Ki_analisis = min(200.0, float(st.session_state.ctrl_Ki_global))
+                st.session_state.ctrl_Ki_analisis = float(st.session_state.ctrl_Ki_global)
                 st.session_state.ctrl_Ki_global = st.slider(
-                    "Ki", 0.0, 200.0, step=0.5,
+                    "Ki", 0.0, 400.0, step=0.5,
                     key="ctrl_Ki_analisis", on_change=_sync_Ki_analisis)
                 st.session_state[f"{tipo}_Ki"] = st.session_state.ctrl_Ki_global
             if tipo in ("PD", "PID"):
-                st.session_state.ctrl_Kd_analisis = min(30.0, float(st.session_state.ctrl_Kd_global))
+                st.session_state.ctrl_Kd_analisis = float(st.session_state.ctrl_Kd_global)
                 st.session_state.ctrl_Kd_global = st.slider(
-                    "Kd", 0.0, 30.0, step=0.05,
+                    "Kd", 0.0, 100.0, step=0.05,
                     key="ctrl_Kd_analisis", on_change=_sync_Kd_analisis)
                 st.session_state[f"{tipo}_Kd"] = st.session_state.ctrl_Kd_global
 
@@ -556,19 +556,19 @@ with tab_simulacion:
                 with st.expander("📋 Pasos del diseño", expanded=False):
                     st.code(st.session_state.comp_diseno_texto, language="text")
         else:
-            st.session_state.ctrl_Kp_sim = min(200.0, float(st.session_state.ctrl_Kp_global))
+            st.session_state.ctrl_Kp_sim = float(st.session_state.ctrl_Kp_global)
             st.session_state.ctrl_Kp_global = st.slider(
-                "Kp", 0.0, 200.0, step=0.5,
+                "Kp", 0.0, 400.0, step=0.5,
                 key="ctrl_Kp_sim", on_change=_sync_Kp_sim)
             if sim_tipo in ("PI", "PID"):
-                st.session_state.ctrl_Ki_sim = min(200.0, float(st.session_state.ctrl_Ki_global))
+                st.session_state.ctrl_Ki_sim = float(st.session_state.ctrl_Ki_global)
                 st.session_state.ctrl_Ki_global = st.slider(
-                    "Ki", 0.0, 200.0, step=0.5,
+                    "Ki", 0.0, 400.0, step=0.5,
                     key="ctrl_Ki_sim", on_change=_sync_Ki_sim)
             if sim_tipo in ("PD", "PID"):
-                st.session_state.ctrl_Kd_sim = min(30.0, float(st.session_state.ctrl_Kd_global))
+                st.session_state.ctrl_Kd_sim = float(st.session_state.ctrl_Kd_global)
                 st.session_state.ctrl_Kd_global = st.slider(
-                    "Kd", 0.0, 30.0, step=0.05,
+                    "Kd", 0.0, 100.0, step=0.05,
                     key="ctrl_Kd_sim", on_change=_sync_Kd_sim)
 
         st.markdown("---")
@@ -920,12 +920,12 @@ with tab_fisico:
             st.session_state.ctrl_Kp_global = f_Kp
             if f_tipo in ("PI", "PID"):
                 st.session_state.ctrl_Ki_fisico = min(300.0, float(st.session_state.ctrl_Ki_global))
-                f_Ki = st.slider("Ki", 0.0, 300.0, step=1.0,
+                f_Ki = st.slider("Ki", 0.0, 300.0, step=0.5,
                                   key="ctrl_Ki_fisico", on_change=_sync_Ki_fisico)
                 st.session_state.ctrl_Ki_global = f_Ki
             if f_tipo in ("PD", "PID"):
                 st.session_state.ctrl_Kd_fisico = min(50.0, float(st.session_state.ctrl_Kd_global))
-                f_Kd = st.slider("Kd", 0.0, 50.0, step=0.5,
+                f_Kd = st.slider("Kd", 0.0, 100.0, step=0.1,
                                   key="ctrl_Kd_fisico", on_change=_sync_Kd_fisico)
                 st.session_state.ctrl_Kd_global = f_Kd
 
